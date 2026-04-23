@@ -1,0 +1,283 @@
+name: Setup Final Task
+
+on:
+  workflow_dispatch:
+    inputs:
+      step:
+        description: 'Which step to run: wallet | spend | multisig | psbt | p2wsh | opreturn'
+        required: true
+        default: 'wallet'
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Bitcoin Core
+        run: |
+          wget -q https://bitcoincore.org/bin/bitcoin-core-28.0/bitcoin-28.0-x86_64-linux-gnu.tar.gz
+          tar -xzf bitcoin-28.0-x86_64-linux-gnu.tar.gz
+          sudo ln -s $PWD/bitcoin-28.0/bin/* /usr/local/bin/
+          mkdir -p ~/.bitcoin
+          cat > ~/.bitcoin/bitcoin.conf <<EOF
+          signet=1
+          rpcconnect=161.35.161.124
+          rpcuser=btrustbuildersrpc
+          rpcpassword=btrustbuilderspass
+          [signet]
+          rpcconnect=161.35.161.124
+          rpcuser=btrustbuildersrpc
+          rpcpassword=btrustbuilderspass
+          EOF
+          bitcoin-cli -signet getblockcount
+
+      # ── STEP: wallet ─────────────────────────────────────────────────────────
+      - name: Step wallet — create wallet, descriptor, address
+        if: ${{ github.event.inputs.step == 'wallet' }}
+        run: |
+          WALLET="rosemary21"
+
+          # Create wallet (ignore error if already exists)
+          bitcoin-cli -signet createwallet "$WALLET" false false "" false true 2>/dev/null || \
+          bitcoin-cli -signet loadwallet "$WALLET" 2>/dev/null || true
+
+          echo "$WALLET" > submission/wallet.txt
+
+          # Export receiving descriptor (external wpkh, index 0)
+          DESC=$(bitcoin-cli -signet -rpcwallet="$WALLET" listdescriptors | jq -r '
+            .descriptors[]
+            | select(.active==true and .internal==false)
+            | select(.desc | startswith("wpkh"))
+            | .desc' | head -1)
+          echo "$DESC" > submission/descriptor.txt
+          echo "descriptor: $DESC"
+
+          # Get native SegWit address
+          ADDR=$(bitcoin-cli -signet -rpcwallet="$WALLET" getnewaddress "" bech32)
+          echo "$ADDR" > submission/address.txt
+          echo "address: $ADDR"
+
+          echo ""
+          echo "=== ACTION REQUIRED ==="
+          echo "Fund this address via https://alt.signetfaucet.com :"
+          echo "  $ADDR"
+          echo "After it confirms, run this workflow again with step=spend"
+
+      # ── STEP: spend ─────────────────────────────────────────────────────────
+      - name: Step spend — tx1 block/coinbase + tx2 (10000 sats, 700 fee, RBF)
+        if: ${{ github.event.inputs.step == 'spend' }}
+        run: |
+          WALLET="rosemary21"
+          TARGET="tb1qddpcyus3u603n63lk7m5epjllgexc24vj5ltp7"
+
+          bitcoin-cli -signet loadwallet "$WALLET" 2>/dev/null || true
+
+          ADDRESS=$(cat submission/address.txt)
+
+          # Find confirmed funding tx
+          TX1=$(bitcoin-cli -signet -rpcwallet="$WALLET" listtransactions "*" 50 0 true | \
+            jq -r --arg addr "$ADDRESS" '
+              [.[] | select(.category=="receive" and .address==$addr and .confirmations>=1)]
+              | sort_by(.time) | last | .txid')
+
+          if [ -z "$TX1" ] || [ "$TX1" = "null" ]; then
+            echo "No confirmed funding tx found for $ADDRESS. Fund it first."
+            exit 1
+          fi
+          echo "$TX1" > submission/transaction-1.txt
+          echo "transaction-1: $TX1"
+
+          BLOCK1=$(bitcoin-cli -signet -rpcwallet="$WALLET" gettransaction "$TX1" | jq -r '.blockhash')
+          echo "$BLOCK1" > submission/block-1.txt
+          bitcoin-cli -signet getblock "$BLOCK1" | jq -r '.tx[0]' > submission/coinbase-1.txt
+          echo "block-1: $BLOCK1"
+
+          # Build spend tx: 10000 sats to target, 700 sat fee, RBF (sequence=0xFFFFFFFD)
+          UTXO_VOUT=$(bitcoin-cli -signet getrawtransaction "$TX1" true | \
+            jq --arg a "$ADDRESS" '.vout[] | select(.scriptPubKey.address==$a) | .n')
+          UTXO_SATS=$(bitcoin-cli -signet getrawtransaction "$TX1" true | \
+            jq --arg a "$ADDRESS" '.vout[] | select(.scriptPubKey.address==$a) | (.value*1e8|round)')
+
+          CHANGE_SATS=$(( UTXO_SATS - 10000 - 700 ))
+          CHANGE_BTC=$(python3 -c "print(f'{$CHANGE_SATS/1e8:.8f}')")
+          CHANGE_ADDR=$(bitcoin-cli -signet -rpcwallet="$WALLET" getrawchangeaddress bech32)
+
+          RAW_TX=$(bitcoin-cli -signet createrawtransaction \
+            "[{\"txid\":\"$TX1\",\"vout\":$UTXO_VOUT,\"sequence\":4294967293}]" \
+            "{\"$TARGET\":0.00010000,\"$CHANGE_ADDR\":$CHANGE_BTC}")
+
+          SIGNED=$(bitcoin-cli -signet -rpcwallet="$WALLET" signrawtransactionwithwallet "$RAW_TX" | jq -r '.hex')
+          TX2=$(bitcoin-cli -signet sendrawtransaction "$SIGNED")
+          echo "$TX2" > submission/transaction-2.txt
+          echo "transaction-2: $TX2"
+
+          # Wait for TX2 to confirm
+          echo "Waiting for TX2 confirmation..."
+          for i in $(seq 1 30); do
+            CONFS=$(bitcoin-cli -signet -rpcwallet="$WALLET" gettransaction "$TX2" | jq -r '.confirmations // 0')
+            echo "  confirmations: $CONFS"
+            [ "$CONFS" -ge 1 ] && break
+            sleep 60
+          done
+
+          BLOCK2=$(bitcoin-cli -signet -rpcwallet="$WALLET" gettransaction "$TX2" | jq -r '.blockhash')
+          echo "$BLOCK2" > submission/block-2.txt
+          bitcoin-cli -signet getblock "$BLOCK2" | jq -r '.tx[0]' > submission/coinbase-2.txt
+          echo "block-2: $BLOCK2"
+
+      # ── STEP: multisig ───────────────────────────────────────────────────────
+      - name: Step multisig — create 2-of-3 P2SH multisig address
+        if: ${{ github.event.inputs.step == 'multisig' }}
+        run: |
+          WALLET="rosemary21"
+          bitcoin-cli -signet loadwallet "$WALLET" 2>/dev/null || true
+
+          KEY1=$(bitcoin-cli -signet -rpcwallet="$WALLET" getaddressinfo \
+            "$(bitcoin-cli -signet -rpcwallet="$WALLET" getnewaddress)" | jq -r '.pubkey')
+          KEY2=$(bitcoin-cli -signet -rpcwallet="$WALLET" getaddressinfo \
+            "$(bitcoin-cli -signet -rpcwallet="$WALLET" getnewaddress)" | jq -r '.pubkey')
+          KEY3=$(bitcoin-cli -signet -rpcwallet="$WALLET" getaddressinfo \
+            "$(bitcoin-cli -signet -rpcwallet="$WALLET" getnewaddress)" | jq -r '.pubkey')
+
+          MULTISIG=$(bitcoin-cli -signet createmultisig 2 "[\"$KEY1\",\"$KEY2\",\"$KEY3\"]" "legacy")
+          echo "$MULTISIG" | jq -r '.address'      > submission/multisig-address.txt
+          echo "$MULTISIG" | jq -r '.redeemScript' > submission/multisig-redeem.txt
+
+          MU_ADDR=$(cat submission/multisig-address.txt)
+          echo ""
+          echo "=== ACTION REQUIRED ==="
+          echo "Fund this multisig address via https://alt.signetfaucet.com :"
+          echo "  $MU_ADDR"
+          echo "After it confirms, run this workflow again with step=psbt"
+
+      # ── STEP: psbt ───────────────────────────────────────────────────────────
+      - name: Step psbt — save multisig tx/block/coinbase + create PSBT
+        if: ${{ github.event.inputs.step == 'psbt' }}
+        run: |
+          WALLET="rosemary21"
+          TARGET="tb1qddpcyus3u603n63lk7m5epjllgexc24vj5ltp7"
+          bitcoin-cli -signet loadwallet "$WALLET" 2>/dev/null || true
+
+          MU_ADDR=$(cat submission/multisig-address.txt)
+
+          # Find multisig funding tx
+          MU_TXID=$(bitcoin-cli -signet -rpcwallet="$WALLET" listtransactions "*" 50 0 true | \
+            jq -r --arg a "$MU_ADDR" '
+              [.[] | select(.address==$a and .confirmations>=1)]
+              | sort_by(.time) | last | .txid // empty')
+
+          if [ -z "$MU_TXID" ]; then
+            # Try via raw tx lookup
+            MU_TXID=$(bitcoin-cli -signet -rpcwallet="$WALLET" listunspent 1 9999999 "[]" true \
+              '{"minimumAmount":0}' | jq -r --arg a "$MU_ADDR" \
+              '[.[] | select(.address==$a)] | last | .txid // empty')
+          fi
+
+          if [ -z "$MU_TXID" ] || [ "$MU_TXID" = "null" ]; then
+            echo "No confirmed multisig funding tx found. Fund $MU_ADDR first."
+            exit 1
+          fi
+          echo "$MU_TXID" > submission/multisig-transaction.txt
+
+          MU_BLOCK=$(bitcoin-cli -signet getrawtransaction "$MU_TXID" true | jq -r '.blockhash')
+          echo "$MU_BLOCK" > submission/multisig-block.txt
+          bitcoin-cli -signet getblock "$MU_BLOCK" | jq -r '.tx[0]' > submission/multisig-coinbase.txt
+          echo "multisig-transaction: $MU_TXID"
+
+          # Create, sign and broadcast PSBT (5000 sats to target)
+          PSBT_UNSIGNED=$(bitcoin-cli -signet -rpcwallet="$WALLET" walletcreatefundedpsbt \
+            "[]" "[{\"$TARGET\":0.00005000}]" 0 '{"fee_rate":1}' | jq -r '.psbt')
+
+          PSBT_SIGNED=$(bitcoin-cli -signet -rpcwallet="$WALLET" walletprocesspsbt \
+            "$PSBT_UNSIGNED" | jq -r '.psbt')
+          echo "$PSBT_SIGNED" > submission/psbt.txt
+
+          PSBT_HEX=$(bitcoin-cli -signet finalizepsbt "$PSBT_SIGNED" | jq -r '.hex')
+          bitcoin-cli -signet sendrawtransaction "$PSBT_HEX" > submission/psbt-tx.txt
+          echo "psbt-tx: $(cat submission/psbt-tx.txt)"
+
+          echo ""
+          echo "Next: run workflow with step=p2wsh"
+
+      # ── STEP: p2wsh ──────────────────────────────────────────────────────────
+      - name: Step p2wsh — create P2WSH 2-of-3 address
+        if: ${{ github.event.inputs.step == 'p2wsh' }}
+        run: |
+          WALLET="rosemary21"
+          bitcoin-cli -signet loadwallet "$WALLET" 2>/dev/null || true
+
+          WK1=$(bitcoin-cli -signet -rpcwallet="$WALLET" getaddressinfo \
+            "$(bitcoin-cli -signet -rpcwallet="$WALLET" getnewaddress)" | jq -r '.pubkey')
+          WK2=$(bitcoin-cli -signet -rpcwallet="$WALLET" getaddressinfo \
+            "$(bitcoin-cli -signet -rpcwallet="$WALLET" getnewaddress)" | jq -r '.pubkey')
+          WK3=$(bitcoin-cli -signet -rpcwallet="$WALLET" getaddressinfo \
+            "$(bitcoin-cli -signet -rpcwallet="$WALLET" getnewaddress)" | jq -r '.pubkey')
+
+          P2WSH=$(bitcoin-cli -signet createmultisig 2 "[\"$WK1\",\"$WK2\",\"$WK3\"]" "bech32")
+          echo "$P2WSH" | jq -r '.address'      > submission/p2wsh-address.txt
+          echo "$P2WSH" | jq -r '.redeemScript' > submission/p2wsh-witness-script.txt
+
+          P2WSH_ADDR=$(cat submission/p2wsh-address.txt)
+          echo ""
+          echo "=== ACTION REQUIRED ==="
+          echo "Fund this P2WSH address via https://alt.signetfaucet.com :"
+          echo "  $P2WSH_ADDR"
+          echo "After it confirms, run this workflow again with step=opreturn"
+
+      # ── STEP: opreturn ───────────────────────────────────────────────────────
+      - name: Step opreturn — save P2WSH tx + broadcast OP_RETURN tx
+        if: ${{ github.event.inputs.step == 'opreturn' }}
+        run: |
+          WALLET="rosemary21"
+          bitcoin-cli -signet loadwallet "$WALLET" 2>/dev/null || true
+
+          P2WSH_ADDR=$(cat submission/p2wsh-address.txt)
+
+          # Find P2WSH funding tx
+          P2WSH_TXID=$(bitcoin-cli -signet -rpcwallet="$WALLET" listtransactions "*" 50 0 true | \
+            jq -r --arg a "$P2WSH_ADDR" '
+              [.[] | select(.address==$a and .confirmations>=1)]
+              | sort_by(.time) | last | .txid // empty')
+
+          if [ -z "$P2WSH_TXID" ] || [ "$P2WSH_TXID" = "null" ]; then
+            echo "No confirmed P2WSH funding tx found. Fund $P2WSH_ADDR first."
+            exit 1
+          fi
+          echo "$P2WSH_TXID" > submission/p2wsh-funding-tx.txt
+          echo "p2wsh-funding-tx: $P2WSH_TXID"
+
+          # OP_RETURN transaction
+          USERNAME_HEX=$(echo -n "rosemary21" | xxd -p)
+
+          UTXO=$(bitcoin-cli -signet -rpcwallet="$WALLET" listunspent 1 9999999 | \
+            jq '[.[]|select(.amount>0.00001)]|sort_by(.amount)|last')
+          OP_TXID=$(echo "$UTXO" | jq -r '.txid')
+          OP_VOUT=$(echo "$UTXO" | jq -r '.vout')
+          OP_SATS=$(echo "$UTXO" | jq '(.amount*1e8|round)')
+
+          OP_CHANGE_SATS=$(( OP_SATS - 500 ))
+          OP_CHANGE_BTC=$(python3 -c "print(f'{$OP_CHANGE_SATS/1e8:.8f}')")
+          OP_CHANGE_ADDR=$(bitcoin-cli -signet -rpcwallet="$WALLET" getrawchangeaddress bech32)
+
+          OP_RAW=$(bitcoin-cli -signet createrawtransaction \
+            "[{\"txid\":\"$OP_TXID\",\"vout\":$OP_VOUT}]" \
+            "[{\"data\":\"$USERNAME_HEX\"},{\"$OP_CHANGE_ADDR\":$OP_CHANGE_BTC}]")
+
+          OP_SIGNED=$(bitcoin-cli -signet -rpcwallet="$WALLET" signrawtransactionwithwallet \
+            "$OP_RAW" | jq -r '.hex')
+          bitcoin-cli -signet sendrawtransaction "$OP_SIGNED" > submission/opreturn-tx.txt
+          echo "opreturn-tx: $(cat submission/opreturn-tx.txt)"
+
+      # ── Commit results back to repo ──────────────────────────────────────────
+      - name: Commit submission files
+        run: |
+          git config user.email "github-actions@github.com"
+          git config user.name "GitHub Actions"
+          git add submission/
+          git diff --staged --quiet || git commit -m "auto: populate submission files (step=${{ github.event.inputs.step }})"
+          git push
